@@ -427,6 +427,7 @@ mod tests {
             distance: 1.,
             closed: true,
             topology: None,
+            trimmed: false,
         });
         let mut document = Document::new("legacy offset circles");
         let sketch_id =

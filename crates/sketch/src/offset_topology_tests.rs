@@ -196,6 +196,7 @@ fn convex_dependency_preflight_and_disappearing_region_are_atomic() {
         distance: 1.,
         closed: false,
         topology: None,
+        trimmed: false,
     });
     assert!(sk.validate_offset_topologies().unwrap_err().to_string().contains("work limit"));
 }

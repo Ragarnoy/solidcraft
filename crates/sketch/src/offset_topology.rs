@@ -636,6 +636,7 @@ impl Sketch {
             distance,
             closed: true,
             topology: Some(OffsetTopology { version: 1, id: association.clone(), roles }),
+            trimmed: false,
         });
         candidate.validate_offset_topologies()?;
         *self = candidate;

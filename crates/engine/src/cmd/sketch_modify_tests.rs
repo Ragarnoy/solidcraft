@@ -4702,7 +4702,8 @@ fn inside_offset_wall(s: &Session, output: &str) -> Vec2 {
 fn freeform_offsets_trim_folds_and_round_chain_corners_into_an_extrudable_wall() {
     // A cookie-cutter outline whose notch near (4.2, 36) bends with a radius of about
     // 0.3 mm: 1.26 mm outwards its plain offset folds over itself there. The offset is
-    // trimmed to the parallel boundary (open splines meeting at a corner), unlinked.
+    // trimmed to the parallel boundary (open splines meeting at a corner), and is driven by
+    // its distance like any other offset (#12294).
     let cookie = json!([
         [0, 0],
         [-1.6, 12.8],
@@ -4727,11 +4728,12 @@ fn freeform_offsets_trim_folds_and_round_chain_corners_into_an_extrudable_wall()
     let out = run(&mut s, "sketch.offset", json!({"curves": ["s1"], "distance": 1.26}));
     let curves = ids(&out["curves"]);
     assert!(!curves.is_empty(), "{out}");
-    assert_eq!(out["param"], Value::Null, "a trimmed offset has no distance to drive: {out}");
+    assert!(out["param"].is_string(), "a trimmed offset has its distance to drive: {out}");
     assert_eq!(out["sketch"]["dof"], source_dof, "the offset adds no freedom: {out}");
-    assert_eq!(s.doc.params.len(), params, "no orphan distance parameter");
+    assert_eq!(s.doc.params.len(), params + 1, "one distance parameter");
     let sk = sketch(&s);
-    assert!(sk.freeform_offsets.is_empty() && !sk.constraints.iter().any(|c| matches!(c.kind, ConstraintKind::OffsetDistance { .. })));
+    assert!(sk.freeform_offsets.is_empty() && sk.offsets.len() == 1 && sk.offsets[0].trimmed);
+    assert_eq!(sk.constraints.iter().filter(|c| matches!(c.kind, ConstraintKind::OffsetDistance { .. })).count(), 1);
     // The source and its offset bound the inner region and the wall around it.
     let areas = profiles(&s);
     assert_eq!(areas.len(), 2, "{areas:?}");
@@ -6385,28 +6387,154 @@ fn a_far_away_point_does_not_keep_a_constraint_the_move_broke() {
     assert_eq!(r["released"], json!([{"id": level, "kind": "Horizontal"}]), "{r}");
 }
 
-/// #12294: a spline offset together with a line is trimmed and unlinked, so a distance that names a
-/// parameter drives nothing. The reply says so; a linked offset of the same parameter does not.
+/// How far the curves `made` stray from being `distance` away from the curves `sources`: the
+/// largest difference between `distance` and a point of `made`'s nearest approach to `sources`.
+fn offset_error(sk: &solidcraft_sketch::Sketch, sources: &[String], made: &[String], distance: f64) -> f64 {
+    let polyline = |id: &String| sk.polyline(sk.curve_index(id).unwrap());
+    let source: Vec<Vec<Vec2>> = sources.iter().map(polyline).collect();
+    let nearest = |q: Vec2| {
+        source
+            .iter()
+            .flat_map(|line| line.windows(2))
+            .map(|w| {
+                let (a, b) = (w[0], w[1]);
+                let t = if (b - a).len2() > 0.0 { ((q - a).dot(b - a) / (b - a).len2()).clamp(0.0, 1.0) } else { 0.0 };
+                q.dist(a + (b - a) * t)
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    made.iter().flat_map(polyline).map(|q| (nearest(q) - distance).abs()).fold(0.0, f64::max)
+}
+
+/// #12294: a spline offset together with another curve is the trimmed outline of the chain, and
+/// is linked to it: the distance gets its driving dimension under the name asked for, and
+/// changing the parameter moves the same curves to the new distance.
 #[test]
-fn an_unlinked_offset_says_its_parameter_drives_nothing() {
+fn a_chain_offset_with_a_spline_is_driven_by_its_distance() {
+    let spline = json!({"points": [[-20, 0], [-10, 15], [10, 15], [20, 0]]});
+    // The other curve of the chain: the line back along the bottom, or a second spline there.
+    let closers =
+        [("sketch.line", json!({"points": [[20, 0], [-20, 0]]})), ("sketch.spline.fit_point", json!({"points": [[20, 0], [0, -6], [-20, 0]]}))];
+    for (closer, points) in closers {
+        let mut s = new_sketch();
+        run(&mut s, "parameters.add", json!({"name": "wall", "expression": "1 mm"}));
+        let sp = ids(&run(&mut s, "sketch.spline.fit_point", spline.clone())["curves"])[0].clone();
+        let other = ids(&run(&mut s, closer, points.clone())["curves"])[0].clone();
+        let sources = [sp.clone(), other];
+        let r = run(&mut s, "sketch.offset", json!({"curves": [sp], "distance": "wall", "side": [0, 5], "param": "w_in"}));
+        assert_eq!(r["param"], "w_in", "{closer}: {r}");
+        assert!(r.get("warning").is_none(), "{closer}: {r}");
+        let made = ids(&r["curves"]);
+        // The polylines these are measured on are chords of curves fitted to 1e-3 mm.
+        assert!(offset_error(&sketch(&s), &sources, &made, 1.0) < 0.02, "{closer}: {}", offset_error(&sketch(&s), &sources, &made, 1.0));
+        let points_before = sketch(&s).points.len();
+        for (wall, distance) in [("2 mm", 2.0), ("0.5 mm", 0.5), ("1 mm", 1.0)] {
+            run(&mut s, "parameters.change", json!({"name": "wall", "expression": wall}));
+            let sk = sketch(&s);
+            assert!(made.iter().all(|id| sk.curve_index(id).is_some()), "{closer} at {wall}: the offset's curves keep their ids");
+            assert!(offset_error(&sk, &sources, &made, distance) < 0.02, "{closer} at {wall}: {}", offset_error(&sk, &sources, &made, distance));
+            // Points are only ever added at the end: the ones that were there keep their index.
+            assert!(sk.points.len() >= points_before, "{closer} at {wall}");
+        }
+        // Moving the source moves the offset with it.
+        let moved = sketch(&s).curves[sketch(&s).curve_index(&sources[0]).unwrap()].kind.point_ids()[1];
+        let moved = sketch(&s).points[moved].id.clone();
+        run(&mut s, "sketch.move_point", json!({"point": moved, "to": [-10, 18]}));
+        assert!(offset_error(&sketch(&s), &sources, &made, 1.0) < 0.02, "{closer}: {}", offset_error(&sketch(&s), &sources, &made, 1.0));
+        // A plain number has its dimension too.
+        let mut s = new_sketch();
+        let sp = ids(&run(&mut s, "sketch.spline.fit_point", spline.clone())["curves"])[0].clone();
+        run(&mut s, closer, points);
+        let r = run(&mut s, "sketch.offset", json!({"curves": [sp], "distance": 1, "side": [0, 5]}));
+        assert!(r["param"].is_string(), "{closer}: {r}");
+    }
+}
+
+/// #12294: at a distance the trimmed outline cannot follow (here the offset swallows the whole
+/// shape) the sketch fails to rebuild, as it does for any offset that cannot, instead of
+/// keeping a stale offset; a distance that fits brings the same curves back.
+#[test]
+fn a_chain_offset_fails_at_a_distance_its_outline_cannot_follow_and_recovers() {
     let mut s = new_sketch();
     run(&mut s, "parameters.add", json!({"name": "wall", "expression": "1 mm"}));
     let sp = ids(&run(&mut s, "sketch.spline.fit_point", json!({"points": [[-20, 0], [-10, 15], [10, 15], [20, 0]]}))["curves"])[0].clone();
-    run(&mut s, "sketch.line", json!({"points": [[20, 0], [-20, 0]]}));
-    let r = run(&mut s, "sketch.offset", json!({"curves": [sp], "distance": "wall", "side": [0, 5], "param": "w_in"}));
-    assert!(r["param"].is_null(), "{r}");
-    let warning = r["warning"].as_str().unwrap_or_default();
-    assert!(warning.contains("not linked to its source"), "{r}");
-    // A rectangle's offset is linked: its parameter drives it and nothing is said.
+    let line = ids(&run(&mut s, "sketch.line", json!({"points": [[20, 0], [-20, 0]]}))["curves"])[0].clone();
+    let r = run(&mut s, "sketch.offset", json!({"curves": [sp], "distance": "wall", "side": [0, 5]}));
+    let made = ids(&r["curves"]);
+    let sources = [sp, line];
+    let id = s.active_sketch.unwrap();
+    let _ = s.execute("parameters.change", &json!({"name": "wall", "expression": "40 mm"}));
+    let stale = s.model.state().sketch(id).is_some_and(|solved| offset_error(&solved.sketch, &sources, &made, 40.0) > 0.02);
+    assert!(!stale, "no offset is left standing at a distance it was not built for");
+    run(&mut s, "parameters.change", json!({"name": "wall", "expression": "2 mm"}));
+    let sk = sketch(&s);
+    assert!(made.iter().all(|id| sk.curve_index(id).is_some()));
+    assert!(offset_error(&sk, &sources, &made, 2.0) < 0.02, "{}", offset_error(&sk, &sources, &made, 2.0));
+    // Break leaves the curves where they are, as ordinary curves nothing drives or holds.
+    let points = sketch(&s).points.len();
+    run(&mut s, "sketch.offset.break", json!({"curve": made[0]}));
+    let sk = sketch(&s);
+    assert!(sk.offsets.is_empty());
+    assert!(made.iter().all(|id| sk.curve_index(id).is_some()));
+    assert_eq!(sk.points.len(), points, "break adds no point");
+    let held: Vec<&str> = made
+        .iter()
+        .filter_map(|id| sk.curve_index(id))
+        .flat_map(|c| sk.curves[c].kind.point_ids())
+        .filter(|&p| sk.points[p].fixed)
+        .map(|p| sk.points[p].id.as_str())
+        .collect();
+    assert!(held.is_empty(), "break leaves no point of the outline held: {held:?}");
+}
+
+/// #12294: several instances of a trimmed offset stand one behind the other, each a trimmed
+/// offset of the one before it, and all of them follow the one distance.
+#[test]
+fn instances_of_a_chain_offset_with_a_spline_all_follow_its_distance() {
     let mut s = new_sketch();
     run(&mut s, "parameters.add", json!({"name": "wall", "expression": "1 mm"}));
-    let lines: Vec<String> = [[[0, 0], [20, 0]], [[20, 0], [20, 10]], [[20, 10], [0, 10]], [[0, 10], [0, 0]]]
-        .iter()
-        .map(|p| ids(&run(&mut s, "sketch.line", json!({"points": p}))["curves"])[0].clone())
-        .collect();
-    let r = run(&mut s, "sketch.offset", json!({"curves": lines, "distance": "wall", "side": [10, 5]}));
-    assert!(r["param"].is_string(), "{r}");
-    assert!(r.get("warning").is_none(), "{r}");
+    let sp = ids(&run(&mut s, "sketch.spline.fit_point", json!({"points": [[-20, 0], [-10, 15], [10, 15], [20, 0]]}))["curves"])[0].clone();
+    let line = ids(&run(&mut s, "sketch.line", json!({"points": [[20, 0], [-20, 0]]}))["curves"])[0].clone();
+    let r = run(&mut s, "sketch.offset", json!({"curves": [sp], "distance": "wall", "side": [0, -5], "instances": 3}));
+    let sources = [sp, line];
+    let rungs: Vec<Vec<String>> = r["sides"].as_array().unwrap().iter().map(|side| ids(&side["curves"])).collect();
+    assert_eq!(rungs.len(), 3, "{r}");
+    let sk = sketch(&s);
+    assert!(sk.freeform_offsets.is_empty() && sk.offsets.len() == 3 && sk.offsets.iter().all(|o| o.trimmed), "{:?}", sk.offsets);
+    for wall in [1.0, 1.5, 0.75] {
+        run(&mut s, "parameters.change", json!({"name": "wall", "expression": format!("{wall} mm")}));
+        let sk = sketch(&s);
+        for (n, rung) in rungs.iter().enumerate() {
+            let distance = wall * (n + 1) as f64;
+            assert!(
+                offset_error(&sk, &sources, rung, distance) < 0.03,
+                "instance {} at {wall}: {}",
+                n + 1,
+                offset_error(&sk, &sources, rung, distance)
+            );
+        }
+    }
+}
+
+/// #12294: one spline whose offset folds over a tight bend is trimmed, and is driven by its
+/// distance all the same.
+#[test]
+fn a_trimmed_offset_of_one_spline_is_driven_by_its_distance() {
+    let mut s = new_sketch();
+    run(&mut s, "parameters.add", json!({"name": "wall", "expression": "0.6 mm"}));
+    // A hairpin: its offset to the inside folds over the bend.
+    let sp =
+        ids(&run(&mut s, "sketch.spline.fit_point", json!({"points": [[-25, -26], [2.6, 3], [10.9, 10.7], [-13.9, -3.8]]}))["curves"])[0].clone();
+    let r = run(&mut s, "sketch.offset", json!({"curves": [sp], "distance": "wall", "param": "w_in"}));
+    assert_eq!(r["param"], "w_in", "{r}");
+    let made = ids(&r["curves"]);
+    assert!(made.len() > 1, "the fold is trimmed into curves that meet at a corner: {r}");
+    let sources = [sp];
+    assert!(offset_error(&sketch(&s), &sources, &made, 0.6) < 0.02, "{}", offset_error(&sketch(&s), &sources, &made, 0.6));
+    run(&mut s, "parameters.change", json!({"name": "wall", "expression": "0.5 mm"}));
+    let sk = sketch(&s);
+    assert!(made.iter().all(|id| sk.curve_index(id).is_some()));
+    assert!(offset_error(&sk, &sources, &made, 0.5) < 0.02, "{}", offset_error(&sk, &sources, &made, 0.5));
 }
 
 fn side_directions(s: &Session, sides: &[String]) -> Vec<Vec2> {

@@ -12,6 +12,11 @@ pub struct OffsetChain {
     pub closed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<crate::offset_topology::OffsetTopology>,
+    /// A chain with free-form curves in it, offset as the trimmed parallel boundary. Its
+    /// outputs are that boundary's curves in walk order, not one per source, and they are
+    /// rebuilt from the sources by [`Sketch::refresh_trimmed_offsets`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trimmed: bool,
 }
 
 impl OffsetChain {
@@ -31,6 +36,18 @@ impl Sketch {
             .or_else(|| self.freeform_offsets.iter().find(|o| o.output == output).map(|o| o.distance))
     }
 
+    /// A curve an offset rebuilds whole from free-form sources: a linked spline offset, or a
+    /// curve of a trimmed chain offset. It has no shape of its own to edit.
+    pub fn follows_free_form_source(&self, curve: &str) -> bool {
+        self.freeform_offsets.iter().any(|o| o.output == curve) || self.follows_trimmed_offset(curve)
+    }
+
+    /// A curve of a trimmed offset. An offset of it is trimmed too, whatever its shape, so
+    /// that the two are rebuilt one after the other.
+    pub fn follows_trimmed_offset(&self, curve: &str) -> bool {
+        self.offsets.iter().any(|o| o.trimmed && o.owns_output(curve))
+    }
+
     /// A Parallel between an offset line and the source it follows (#4464). The association
     /// keeps them parallel already, and the output's points are held during a solve, so solving
     /// it would only pin the source to the output's current direction. It drives again once
@@ -42,7 +59,7 @@ impl Sketch {
         let (Some(a), Some(b)) = (self.curves.get(a).map(|c| c.id.as_str()), self.curves.get(b).map(|c| c.id.as_str())) else {
             return false;
         };
-        self.offsets.iter().any(|o| {
+        self.offsets.iter().filter(|o| !o.trimmed).any(|o| {
             o.sources.iter().enumerate().any(|(i, (source, _))| {
                 let output = match &o.topology {
                     Some(t) => t.roles.get(i).map(|r| r.output.as_str()),
@@ -225,12 +242,17 @@ impl Sketch {
         }
         candidate.refresh_analytic_offsets()?;
         candidate.refresh_freeform_offsets()?;
+        // Last: a trimmed offset may follow the other kinds' curves, never the other way round.
+        candidate.refresh_trimmed_offsets()?;
         *self = candidate;
         Ok(())
     }
 
     fn refresh_analytic_offsets(&mut self) -> Result<(), SketchError> {
         for index in 0..self.offsets.len() {
+            if self.offsets.get(index).is_some_and(|o| o.trimmed) {
+                continue;
+            }
             if self.refresh_convex_offset(index)? {
                 continue;
             }

@@ -156,7 +156,7 @@ impl Sketch {
         if curve.link.is_some() {
             return Err(SketchError::Invalid("a projected spline follows its source; its points can't be removed".into()));
         }
-        if self.freeform_offsets.iter().any(|o| o.output == curve.id) {
+        if self.follows_free_form_source(&curve.id) {
             return Err(SketchError::Invalid("an offset spline follows its source; break the offset association first".into()));
         }
         if self.freeform_offsets.iter().any(|o| o.source == curve.id) {
@@ -297,7 +297,7 @@ impl Sketch {
         if curve.link.is_some() {
             return Err(SketchError::Invalid("a projected spline follows its source; it takes no points of its own".into()));
         }
-        if self.freeform_offsets.iter().any(|o| o.output == curve.id) {
+        if self.follows_free_form_source(&curve.id) {
             return Err(SketchError::Invalid("an offset spline follows its source; break the offset association first".into()));
         }
         if self.freeform_offsets.iter().any(|o| o.source == curve.id) {

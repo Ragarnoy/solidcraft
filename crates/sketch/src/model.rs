@@ -1954,7 +1954,7 @@ impl Sketch {
 
     /// Is curve `c` held in place: fixed or projected (linked).
     pub fn curve_locked(&self, c: usize) -> bool {
-        self.curves.get(c).is_some_and(|c| c.fixed || c.link.is_some() || self.freeform_offsets.iter().any(|offset| offset.output == c.id))
+        self.curves.get(c).is_some_and(|c| c.fixed || c.link.is_some() || self.follows_free_form_source(&c.id))
     }
 
     /// Radius of a circle or arc.

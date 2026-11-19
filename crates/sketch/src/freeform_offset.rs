@@ -385,6 +385,7 @@ fn geometry(sk: &Sketch, source: usize, forward: bool, d: f64, divisions: usize,
 impl Sketch {
     /// Validate persisted association roles without solving or certifying geometry.
     pub fn validate_freeform_offsets(&self) -> Result<()> {
+        self.validate_trimmed_offsets()?;
         if self.freeform_offsets.is_empty() {
             return Ok(());
         }
@@ -599,10 +600,15 @@ impl Sketch {
     /// ownership of its nodes, and the curve follows the offset when its source moves.
     /// Returns the ids of the constraints added.
     pub fn detach_offset_points(&mut self) -> Result<Vec<String>> {
-        if self.freeform_offsets.is_empty() {
+        if self.freeform_offsets.is_empty() && !self.offsets.iter().any(|o| o.trimmed) {
             return Ok(Vec::new());
         }
-        let outputs: std::collections::BTreeSet<&str> = self.freeform_offsets.iter().map(|o| o.output.as_str()).collect();
+        let outputs: std::collections::BTreeSet<&str> = self
+            .freeform_offsets
+            .iter()
+            .map(|o| o.output.as_str())
+            .chain(self.offsets.iter().filter(|o| o.trimmed).flat_map(|o| o.outputs.iter().map(String::as_str)))
+            .collect();
         let nodes: std::collections::BTreeSet<usize> =
             self.curves.iter().filter(|c| outputs.contains(c.id.as_str())).flat_map(|c| c.kind.point_ids()).collect();
         let taken: Vec<(usize, usize)> = self

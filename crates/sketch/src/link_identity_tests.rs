@@ -524,6 +524,7 @@ fn edge_on_face_saved_as_a_line_pair_keeps_the_line_an_offset_follows() {
         distance: -2.0,
         closed: false,
         topology: None,
+        trimmed: false,
     });
     sk.refresh_offsets().unwrap();
 
@@ -755,6 +756,7 @@ fn halves_of_a_projected_circle_an_offset_follows_stay_halves() {
         distance: 1.0,
         closed: true,
         topology: None,
+        trimmed: false,
     });
     sk.refresh_offsets().unwrap();
 

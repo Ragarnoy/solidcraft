@@ -8,9 +8,10 @@
 //! the offset distance. The kept arcs meet at the plain offset's own crossings, where they
 //! form sharp corners. Each kept run of pieces is fitted with an open spline and certified
 //! like a linked offset; a corner's arc is exact. Every pair of fitted spans is proven
-//! apart except at the nodes they share. The result is ordinary curves: it is not linked
-//! to its source.
-use super::{Certificate, H, MAX_OFFSET_WORK, MAX_PIECES, OFFSET_TOLERANCE, Result, bad, certify, normal_point};
+//! apart except at the nodes they share. The result is linked to its sources: the same
+//! trimming is run again when they or the distance change, and the curves it made take the
+//! new shape as long as the outline still has the same curves in the same order.
+use super::{Certificate, H, MAX_ASSOCIATIONS, MAX_OFFSET_WORK, MAX_PIECES, OFFSET_TOLERANCE, Result, bad, certify, normal_point};
 use crate::{CurveKind, Sketch, fit_beziers};
 use solidcore_record::{Seg2, Vec2};
 use solidcraft_geom::prelude::*;
@@ -42,8 +43,8 @@ pub enum FreeformOffsetOutput {
     /// One spline that follows its source (an associative offset).
     Linked(usize),
     /// Open splines (and corner arcs) meeting where the plain offset's loops were trimmed
-    /// away. They are ordinary curves, not linked to the source.
-    Unlinked(Vec<usize>),
+    /// away. They follow the source too, as long as the same loops are there to trim.
+    Trimmed(Vec<usize>),
 }
 
 /// One piece of the plain offset.
@@ -634,8 +635,10 @@ fn arc_pieces(raw: &Raw, arc: &Arc) -> Result<Vec<(usize, f64, f64)>> {
 /// Fit and certify one run of offset pieces. It starts from a few uniform spans per piece
 /// and halves only the spans whose certificate fails, refitting until every span passes:
 /// sharp bends (a fold's neighbourhood, a set-aside tail) get dense nodes, the rest stays
-/// sparse. `first` and `last` are its exact end nodes.
-fn fit_run(raw: &Raw, run: &[(usize, f64, f64)], first: Vec2, last: Vec2, work: &mut usize) -> Result<Out> {
+/// sparse. `first` and `last` are its exact end nodes. `floor` is the fewest nodes the
+/// spline may have: a rebuilt offset never has fewer than the spline it replaces, so the
+/// points that spline owns all stay in use.
+fn fit_run(raw: &Raw, run: &[(usize, f64, f64)], first: Vec2, last: Vec2, floor: usize, work: &mut usize) -> Result<Out> {
     let segs = run
         .iter()
         .map(|(i, _, _)| match raw.piece(*i)? {
@@ -699,7 +702,18 @@ fn fit_run(raw: &Raw, run: &[(usize, f64, f64)], first: Vec2, last: Vec2, work: 
             }
         }
         if failing.is_empty() {
-            return Ok(Out::Spline { nodes, cubics });
+            if nodes.len() >= floor {
+                return Ok(Out::Spline { nodes, cubics });
+            }
+            // Too few nodes for the spline this replaces: halve the widest spans.
+            let mut widest: Vec<usize> = (0..spans.len()).collect();
+            widest.sort_by(|a, b| {
+                let width = |i: &usize| spans.get(*i).map_or(0.0, |s| s.2 - s.1);
+                width(b).total_cmp(&width(a))
+            });
+            widest.truncate(floor - nodes.len());
+            widest.sort_unstable();
+            failing = widest;
         }
         let located = |error: &crate::SketchError| {
             bad(&format!("the offset could not be fitted within {OFFSET_TOLERANCE} mm near ({:.3}, {:.3}): {error}", near.x, near.y))
@@ -723,7 +737,9 @@ fn fit_run(raw: &Raw, run: &[(usize, f64, f64)], first: Vec2, last: Vec2, work: 
 }
 
 /// Fit one kept arc: a spline for each run of offset pieces, an exact arc for each corner.
-fn fit_arc(raw: &Raw, arc: &Arc, crossings: &[Crossing], work: &mut usize) -> Result<Fitted> {
+/// `floors` is the fewest nodes each output curve may have, by its place among all the
+/// offset's curves; `placed` counts the curves fitted so far.
+fn fit_arc(raw: &Raw, arc: &Arc, crossings: &[Crossing], floors: &[usize], placed: &mut usize, work: &mut usize) -> Result<Fitted> {
     let pieces = arc_pieces(raw, arc)?;
     let at = |end: End, u: f64| match end {
         End::Crossing(i) => crossings.get(i).map(|c| c.at).ok_or_else(|| bad("offset crossing vanished")),
@@ -752,8 +768,9 @@ fn fit_arc(raw: &Raw, arc: &Arc, crossings: &[Crossing], work: &mut usize) -> Re
             let Src::Corner { at, sweep, .. } = raw.piece(piece)? else { return Err(bad("offset run changed kind")) };
             outs.push(Out::Arc { center: *at, start: node, end: next, sweep: sweep * (to - from) });
         } else {
-            outs.push(fit_run(raw, run, node, next, work)?);
+            outs.push(fit_run(raw, run, node, next, floors.get(*placed).copied().unwrap_or(0), work)?);
         }
+        *placed += 1;
         node = next;
         start = end;
     }
@@ -1001,53 +1018,341 @@ fn explain(raw: &Raw, us: &[f64], distance: f64, error: crate::SketchError) -> c
     }
 }
 
+/// The trimmed offset's kept arcs, fitted and proven apart, and how many crossings its plain
+/// offset has. `floors` is the fewest nodes each output curve may have, in order.
+fn trimmed(raw: &Raw, us: &[f64], require_crossing: bool, floors: &[usize]) -> std::result::Result<(Vec<Fitted>, usize), Trim> {
+    let pts = us.iter().map(|u| raw.point(*u)).collect::<Result<Vec<_>>>()?;
+    let src = us.iter().map(|u| raw.source(*u)).collect::<Result<Vec<_>>>()?;
+    let crossings = crossings(raw, us, &pts)?;
+    if crossings.is_empty() && require_crossing {
+        return Err(Trim::NothingToTrim);
+    }
+    let arcs = kept_arcs(raw, &crossings, us, &src)?;
+    let mut work = MAX_OFFSET_WORK;
+    let mut placed = 0;
+    let fitted = arcs.iter().map(|arc| fit_arc(raw, arc, &crossings, floors, &mut placed, &mut work)).collect::<Result<Vec<_>>>()?;
+    verify_trimmed(&fitted)?;
+    Ok((fitted, crossings.len()))
+}
+
 impl Sketch {
     /// Offset a free-form curve. A curve whose plain offset is smooth and simple gets a
     /// linked offset ([`Sketch::add_freeform_offset`]). Where the plain offset folds over
     /// a bend tighter than the distance, or crosses itself, its loops are trimmed away and
-    /// the result is open splines meeting at sharp corners, not linked to the source.
+    /// the result is open splines meeting at sharp corners, linked like a chain's offset.
     pub fn offset_freeform(&mut self, source: usize, forward: bool, distance: f64) -> Result<FreeformOffsetOutput> {
-        let plain = match self.add_freeform_offset(source, forward, distance) {
-            Ok(output) => return Ok(FreeformOffsetOutput::Linked(output)),
-            Err(error) => error,
+        // An offset of a trimmed offset's curve is trimmed too, crossing or not: the two are
+        // then rebuilt in turn, which a linked offset of a spline that gains nodes cannot be.
+        let derived = self.curves.get(source).is_some_and(|c| self.follows_trimmed_offset(&c.id));
+        let plain = if derived {
+            None
+        } else {
+            match self.add_freeform_offset(source, forward, distance) {
+                Ok(output) => return Ok(FreeformOffsetOutput::Linked(output)),
+                Err(error) => Some(error),
+            }
         };
-        let Ok(raw) = Raw::chain(self, &[(source, forward)], distance) else {
-            return Err(plain);
+        let raw = match (Raw::chain(self, &[(source, forward)], distance), &plain) {
+            (Ok(raw), _) => raw,
+            (Err(error), None) => return Err(error),
+            (Err(_), Some(plain)) => return Err(plain.clone()),
         };
         let us = samples(&raw);
-        match self.add_trimmed_offset(&raw, &us, true) {
-            Ok(curves) => Ok(FreeformOffsetOutput::Unlinked(curves)),
-            Err(Trim::NothingToTrim) => Err(explain(&raw, &us, distance, plain)),
+        if self.offsets.iter().filter(|o| o.trimmed).count() >= MAX_ASSOCIATIONS {
+            return Err(bad("too many associative free-form offsets"));
+        }
+        match self.add_trimmed_offset(&raw, &us, !derived) {
+            Ok(curves) => {
+                self.link_trimmed_offset(&[(source, forward)], &curves, distance, raw.closed)?;
+                Ok(FreeformOffsetOutput::Trimmed(curves))
+            }
+            Err(Trim::NothingToTrim) => Err(explain(&raw, &us, distance, plain.unwrap_or_else(|| bad("offset produced nothing")))),
             Err(Trim::Failed(error)) => Err(explain(&raw, &us, distance, error)),
         }
+    }
+
+    /// Record the association of a trimmed offset just made: `curves` follow `order` at `distance`.
+    fn link_trimmed_offset(&mut self, order: &[(usize, bool)], curves: &[usize], distance: f64, closed: bool) -> Result<()> {
+        let id = |sk: &Sketch, i: usize| sk.curves.get(i).map(|c| c.id.clone()).ok_or_else(|| bad("offset curve vanished"));
+        let sources = order.iter().map(|(i, forward)| Ok((id(self, *i)?, *forward))).collect::<Result<Vec<_>>>()?;
+        let outputs = curves.iter().map(|i| id(self, *i)).collect::<Result<Vec<_>>>()?;
+        self.offsets.push(crate::OffsetChain { sources, outputs, distance, closed, topology: None, trimmed: true });
+        Ok(())
     }
 
     /// Offset a chain of curves (oriented, in order) that includes free-form curves: every
     /// piece's normal offset, joined round the chain's corners by arcs and trimmed where it
-    /// folds or crosses. The result is ordinary curves, not linked to the chain.
+    /// folds or crosses. The result is linked to the chain.
     pub fn offset_freeform_chain(&mut self, order: &[(usize, bool)], distance: f64) -> Result<Vec<usize>> {
+        if self.offsets.iter().filter(|o| o.trimmed).count() >= MAX_ASSOCIATIONS {
+            return Err(bad("too many associative free-form offsets"));
+        }
         let raw = Raw::chain(self, order, distance)?;
         let us = samples(&raw);
-        match self.add_trimmed_offset(&raw, &us, false) {
-            Ok(curves) => Ok(curves),
-            Err(Trim::NothingToTrim) => Err(bad("offset chain produced nothing")),
-            Err(Trim::Failed(error)) => Err(explain(&raw, &us, distance, error)),
+        let curves = match self.add_trimmed_offset(&raw, &us, false) {
+            Ok(curves) => curves,
+            Err(Trim::NothingToTrim) => return Err(bad("offset chain produced nothing")),
+            Err(Trim::Failed(error)) => return Err(explain(&raw, &us, distance, error)),
+        };
+        self.link_trimmed_offset(order, &curves, distance, raw.closed)?;
+        Ok(curves)
+    }
+
+    /// Validate saved trimmed offsets without evaluating their geometry. Every record names
+    /// existing curves; its outputs are the open splines and arcs a trimmed offset is made
+    /// of, belong to no other offset, and own their points (no other curve uses one, and
+    /// only the ends are shared between them); a record follows only curves that are there
+    /// before it is rebuilt, so never its own, a later trimmed offset's, and no other kind
+    /// of offset follows a trimmed one.
+    pub(crate) fn validate_trimmed_offsets(&self) -> Result<()> {
+        if !self.offsets.iter().any(|o| o.trimmed) {
+            return Ok(());
         }
+        if self.points.len() > 100_000 || self.curves.len() > 100_000 {
+            return Err(bad("offset sketch exceeds ownership validation limit"));
+        }
+        let invalid = || bad("invalid trimmed offset association");
+        let id_ok = |id: &String| !id.is_empty() && id.len() <= 512;
+        let trimmed: std::collections::BTreeSet<&str> =
+            self.offsets.iter().filter(|o| o.trimmed).flat_map(|o| o.outputs.iter().map(String::as_str)).collect();
+        if self
+            .offsets
+            .iter()
+            .filter(|o| !o.trimmed)
+            .any(|o| o.sources.iter().any(|(id, _)| trimmed.contains(id.as_str())) || trimmed.iter().any(|id| o.owns_output(id)))
+            || self.freeform_offsets.iter().any(|o| trimmed.contains(o.source.as_str()) || trimmed.contains(o.output.as_str()))
+        {
+            return Err(invalid());
+        }
+        // Which record's outputs use each point, and how many times.
+        let mut owner: Vec<Option<usize>> = vec![None; self.points.len()];
+        let mut uses = vec![0usize; self.points.len()];
+        let mut record_of = std::collections::BTreeMap::new();
+        let mut rebuilt = std::collections::BTreeSet::new();
+        let mut work = 0usize;
+        for (index, record) in self.offsets.iter().filter(|o| o.trimmed).enumerate() {
+            if index >= MAX_ASSOCIATIONS
+                || record.topology.is_some()
+                || record.sources.is_empty()
+                || record.sources.len() > 10_000
+                || record.outputs.is_empty()
+                || record.outputs.len() > 10_000
+                || !record.distance.is_finite()
+                || record.distance.abs() < 1e-9
+                || record.distance.abs() > crate::MAX_COORD
+                || !record.sources.iter().all(|(id, _)| id_ok(id) && (!trimmed.contains(id.as_str()) || rebuilt.contains(id.as_str())))
+            {
+                return Err(invalid());
+            }
+            if record.sources.iter().any(|(id, _)| self.curve_index(id).is_none()) {
+                return Err(bad("an offset source vanished or changed shape"));
+            }
+            for id in &record.outputs {
+                let curve = self.curve_index(id).and_then(|i| self.curves.get(i)).ok_or_else(|| bad("invalid trimmed offset output"))?;
+                let (ends, inner): (Vec<usize>, Vec<usize>) = match &curve.kind {
+                    CurveKind::Spline { pts, control: false, degree: 3, periodic: false, handles, .. } if handles.is_empty() && pts.len() >= 2 => {
+                        let ends = [pts.first(), pts.last()].into_iter().flatten().copied().collect();
+                        (ends, pts.iter().skip(1).take(pts.len() - 2).copied().collect())
+                    }
+                    CurveKind::Arc { c, a, b } => (vec![*a, *b], vec![*c]),
+                    _ => return Err(bad("invalid trimmed offset output")),
+                };
+                work = work.saturating_add(ends.len() + inner.len());
+                if !id_ok(id) || record_of.insert(id.as_str(), index).is_some() || work > 1_000_000 {
+                    return Err(bad("invalid trimmed offset output"));
+                }
+                for (point, shared) in ends.iter().map(|p| (*p, true)).chain(inner.iter().map(|p| (*p, false))) {
+                    let free = self.points.get(point).is_some_and(|p| p.link.is_none());
+                    let (Some(owner), Some(uses)) = (owner.get_mut(point), uses.get_mut(point)) else {
+                        return Err(bad("invalid trimmed offset output"));
+                    };
+                    *uses += 1;
+                    if point == 0 || !free || *owner.get_or_insert(index) != index || (!shared && *uses > 1) {
+                        return Err(bad("invalid trimmed offset output point roles"));
+                    }
+                }
+            }
+            rebuilt.extend(record.outputs.iter().map(String::as_str));
+        }
+        // No other curve uses a point a trimmed offset places.
+        for curve in self.curves.iter().filter(|c| !record_of.contains_key(c.id.as_str())) {
+            let points = curve.kind.point_ids();
+            work = work.saturating_add(points.len());
+            if work > 2_000_000 {
+                return Err(bad("offset point ownership work limit exceeded"));
+            }
+            if points.iter().any(|p| owner.get(*p).is_some_and(Option::is_some)) {
+                return Err(bad("a curve uses a point that a trimmed offset places; break the offset first"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild every trimmed offset from its sources at its distance. The curves it made
+    /// keep their ids and their points, and take the new shape; a spline that needs more nodes
+    /// gets new points at the end of the point table, so no point index changes. Where the
+    /// outline no longer has the same curves in the same order (a corner trimmed away, a new
+    /// crossing), there is nothing for the old curves to become and the rebuild is refused.
+    pub(crate) fn refresh_trimmed_offsets(&mut self) -> Result<()> {
+        if !self.offsets.iter().any(|o| o.trimmed) {
+            return Ok(());
+        }
+        self.validate_trimmed_offsets()?;
+        let mut candidate = self.clone();
+        for record in self.offsets.iter().filter(|o| o.trimmed) {
+            candidate.refresh_trimmed_offset(record)?;
+        }
+        *self = candidate;
+        Ok(())
+    }
+
+    fn refresh_trimmed_offset(&mut self, record: &crate::OffsetChain) -> Result<()> {
+        let changed =
+            || bad("the offset's outline changes shape at this distance (a corner or a crossing comes or goes); break the offset or make it again");
+        let edited = || bad("offset output was edited; break its association first");
+        if record.sources.is_empty()
+            || record.sources.len() > 10_000
+            || record.outputs.is_empty()
+            || record.outputs.len() > 10_000
+            || record.topology.is_some()
+            || !record.distance.is_finite()
+            || record.distance.abs() < 1e-9
+            || record.sources.iter().any(|(source, _)| record.outputs.contains(source))
+        {
+            return Err(bad("damaged offset chain"));
+        }
+        let order = record
+            .sources
+            .iter()
+            .map(|(id, forward)| self.curve_index(id).map(|i| (i, *forward)).ok_or_else(|| bad("an offset source vanished or changed shape")))
+            .collect::<Result<Vec<_>>>()?;
+        let old = record.outputs.iter().map(|id| self.curve_index(id).ok_or_else(|| bad("offset output vanished"))).collect::<Result<Vec<_>>>()?;
+        // What each output is now: its points in walk order and, for a spline, its nodes.
+        let floors = old
+            .iter()
+            .map(|i| match self.curves.get(*i).map(|c| &c.kind) {
+                Some(CurveKind::Spline { pts, control: false, degree: 3, periodic: false, handles, .. }) if handles.is_empty() && pts.len() >= 2 => {
+                    Ok(pts.len())
+                }
+                Some(CurveKind::Arc { .. }) => Ok(0),
+                _ => Err(edited()),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let raw = Raw::chain(self, &order, record.distance)?;
+        if raw.closed != record.closed {
+            return Err(changed());
+        }
+        let us = samples(&raw);
+        let fitted = match trimmed(&raw, &us, false, &floors) {
+            Ok((fitted, _)) => fitted,
+            Err(Trim::NothingToTrim) => return Err(changed()),
+            Err(Trim::Failed(error)) => return Err(explain(&raw, &us, record.distance, error)),
+        };
+        if fitted.iter().map(|arc| arc.outs.len()).sum::<usize>() != old.len() {
+            return Err(changed());
+        }
+        // The nodes the new curves share (a crossing, a seam, the joint between two curves of
+        // one kept arc) must be the points the old curves share, and no others.
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum Node {
+            Crossing(usize),
+            Start(usize),
+            End(usize),
+            Inner(usize, usize),
+        }
+        let mut node_point = std::collections::BTreeMap::new();
+        let mut point_node = std::collections::BTreeMap::new();
+        let mut pair = |node: Node, point: usize| -> Result<()> {
+            if *node_point.entry(node).or_insert(point) != point || *point_node.entry(point).or_insert(node) != node {
+                return Err(changed());
+            }
+            Ok(())
+        };
+        let mut placed = 0;
+        let mut plan = Vec::with_capacity(old.len());
+        for (a, arc) in fitted.iter().enumerate() {
+            let end_node = |end: End, own: Node| match end {
+                End::Crossing(i) => Node::Crossing(i),
+                End::Seam => Node::Start(a),
+                End::Free => own,
+            };
+            let count = arc.outs.len();
+            for (k, out) in arc.outs.iter().enumerate() {
+                let from = if k == 0 { end_node(arc.start, Node::Start(a)) } else { Node::Inner(a, k) };
+                let to = if k + 1 < count { Node::Inner(a, k + 1) } else { end_node(arc.end, Node::End(a)) };
+                let curve = *old.get(placed).ok_or_else(changed)?;
+                placed += 1;
+                let (start, end) = match (self.curves.get(curve).map(|c| &c.kind), out) {
+                    (Some(CurveKind::Spline { pts, .. }), Out::Spline { .. }) => match (pts.first(), pts.last()) {
+                        (Some(first), Some(last)) => (*first, *last),
+                        _ => return Err(edited()),
+                    },
+                    // Sketch arcs run counter-clockwise from `a` to `b`.
+                    (Some(CurveKind::Arc { a, b, .. }), Out::Arc { sweep, .. }) => {
+                        if *sweep >= 0.0 {
+                            (*a, *b)
+                        } else {
+                            (*b, *a)
+                        }
+                    }
+                    _ => return Err(changed()),
+                };
+                pair(from, start)?;
+                pair(to, end)?;
+                plan.push((curve, out, start, end));
+            }
+        }
+        let place = |sk: &mut Sketch, index: usize, at: Vec2| -> Result<()> {
+            let point = sk.points.get_mut(index).ok_or_else(|| bad("offset output point vanished"))?;
+            if point.link.is_some() {
+                return Err(edited());
+            }
+            point.pos = at;
+            point.fixed = true;
+            Ok(())
+        };
+        for (curve, out, start, end) in plan {
+            let (start_at, end_at) = out.ends();
+            place(self, start, start_at)?;
+            place(self, end, end_at)?;
+            let kind = match (self.curves.get(curve).map(|c| c.kind.clone()), out) {
+                (Some(CurveKind::Spline { pts, .. }), Out::Spline { nodes, .. }) => {
+                    let inner = nodes.len().saturating_sub(2);
+                    let mut indices = vec![start];
+                    for (k, at) in nodes.iter().skip(1).take(inner).enumerate() {
+                        let index = match pts.get(k + 1).filter(|_| k + 2 < pts.len()) {
+                            Some(index) => *index,
+                            None => self.add_point(*at, None)?,
+                        };
+                        place(self, index, *at)?;
+                        indices.push(index);
+                    }
+                    indices.push(end);
+                    // A kept arc that leaves a crossing and comes back to it starts and ends on one point.
+                    let distinct = indices.iter().skip(usize::from(start == end)).copied().collect::<std::collections::BTreeSet<_>>().len();
+                    if indices.len() < pts.len() || distinct + usize::from(start == end) != indices.len() {
+                        return Err(edited());
+                    }
+                    CurveKind::Spline { pts: indices, control: false, degree: 3, periodic: false, nurbs: None, handles: Vec::new() }
+                }
+                (Some(CurveKind::Arc { c, .. }), Out::Arc { center, sweep, .. }) => {
+                    if c == start || c == end {
+                        return Err(edited());
+                    }
+                    place(self, c, *center)?;
+                    if *sweep >= 0.0 { CurveKind::Arc { c, a: start, b: end } } else { CurveKind::Arc { c, a: end, b: start } }
+                }
+                _ => return Err(changed()),
+            };
+            self.curves.get_mut(curve).ok_or_else(|| bad("offset output vanished"))?.kind = kind;
+        }
+        Ok(())
     }
 
     fn add_trimmed_offset(&mut self, raw: &Raw, us: &[f64], require_crossing: bool) -> std::result::Result<Vec<usize>, Trim> {
-        let pts = us.iter().map(|u| raw.point(*u)).collect::<Result<Vec<_>>>()?;
-        let src = us.iter().map(|u| raw.source(*u)).collect::<Result<Vec<_>>>()?;
-        let crossings = crossings(raw, us, &pts)?;
-        if crossings.is_empty() && require_crossing {
-            return Err(Trim::NothingToTrim);
-        }
-        let arcs = kept_arcs(raw, &crossings, us, &src)?;
-        let mut work = MAX_OFFSET_WORK;
-        let fitted = arcs.iter().map(|arc| fit_arc(raw, arc, &crossings, &mut work)).collect::<Result<Vec<_>>>()?;
-        verify_trimmed(&fitted)?;
+        let (fitted, crossings) = trimmed(raw, us, require_crossing, &[])?;
         let mut candidate = self.clone();
-        let mut corners: Vec<Option<usize>> = vec![None; crossings.len()];
+        let mut corners: Vec<Option<usize>> = vec![None; crossings];
         let mut outputs = Vec::new();
         for arc in &fitted {
             let mut shared = |end: End, at: Vec2, candidate: &mut Sketch| -> Result<usize> {
@@ -1176,7 +1481,7 @@ mod tests {
     fn trimmed_offset_of_closed_spline_with_tight_notch() {
         let (mut sk, source) = spline(&COOKIE, true);
         let before = sk.clone();
-        let FreeformOffsetOutput::Unlinked(curves) = sk.offset_freeform(source, true, 1.26).unwrap() else {
+        let FreeformOffsetOutput::Trimmed(curves) = sk.offset_freeform(source, true, 1.26).unwrap() else {
             panic!("a 1.26 mm offset over a 0.3 mm notch must be trimmed");
         };
         assert!(sk.freeform_offsets.is_empty(), "a trimmed offset is not linked");
@@ -1199,7 +1504,7 @@ mod tests {
     #[test]
     fn trimmed_offset_of_open_spline_hairpin() {
         let (mut sk, source) = spline(&[(-25.0, -26.0), (2.6, 3.0), (10.9, 10.7), (-13.9, -3.8)], false);
-        let FreeformOffsetOutput::Unlinked(curves) = sk.offset_freeform(source, true, 0.6).unwrap() else {
+        let FreeformOffsetOutput::Trimmed(curves) = sk.offset_freeform(source, true, 0.6).unwrap() else {
             panic!("the hairpin offset must be trimmed");
         };
         let exact = sk.exact_segs(source).unwrap();
@@ -1263,6 +1568,112 @@ mod tests {
             let arcs = curves.iter().filter(|c| matches!(sk.curves[**c].kind, CurveKind::Arc { .. })).count();
             assert!(arcs >= 1, "an outer corner is rounded on each side ({distance})");
         }
+    }
+
+    /// A chain's trimmed offset is linked (#12294): at another distance its curves, corner arcs
+    /// included, take the new outline's shape with their ids, and the points that were there
+    /// stay where they are in the point table.
+    #[test]
+    fn chain_offset_follows_its_distance_and_keeps_its_curves() {
+        for sign in [1.0, -1.0] {
+            let (mut sk, order) = bezier_chain();
+            let source: Vec<Seg2> = order.iter().flat_map(|(c, _)| sk.exact_segs(*c).unwrap()).collect();
+            let curves = sk.offset_freeform_chain(&order, 1.26 * sign).unwrap();
+            let ids: Vec<String> = curves.iter().map(|c| sk.curves[*c].id.clone()).collect();
+            assert_eq!(sk.offsets.len(), 1);
+            assert!(sk.offsets[0].trimmed && sk.offsets[0].outputs == ids);
+            sk.validate_freeform_offsets().unwrap();
+            for distance in [1.4, 1.1, 1.26] {
+                let before = sk.clone();
+                sk.offsets[0].distance = distance * sign;
+                sk.refresh_offsets().unwrap();
+                assert_eq!(sk.curves.len(), before.curves.len());
+                assert!(sk.points.len() >= before.points.len());
+                assert!(sk.points.iter().zip(&before.points).all(|(p, q)| p.id == q.id));
+                let now: Vec<usize> = ids.iter().map(|id| sk.curve_index(id).unwrap()).collect();
+                check_offset(&sk, &source, &now, distance, true);
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_trimmed_offset_records_are_refused_not_followed() {
+        let (mut sk, order) = bezier_chain();
+        sk.offset_freeform_chain(&order, 1.26).unwrap();
+        let good = sk.clone();
+        let refused = |sk: &Sketch| {
+            let mut refreshed = sk.clone();
+            let failed = refreshed.refresh_offsets().is_err();
+            failed && sk.validate_freeform_offsets().is_err()
+        };
+        // An output that is its own source, a missing curve, an output of another kind, a
+        // distance that is no number, and the same output twice.
+        let source = good.offsets[0].sources[0].0.clone();
+        let mut sk = good.clone();
+        sk.offsets[0].outputs[0] = source.clone();
+        assert!(refused(&sk));
+        let mut sk = good.clone();
+        sk.offsets[0].outputs.push("nothing".into());
+        assert!(refused(&sk));
+        let mut sk = good.clone();
+        sk.offsets[0].sources.push(("nothing".into(), true));
+        assert!(refused(&sk));
+        let mut sk = good.clone();
+        sk.offsets[0].distance = f64::NAN;
+        assert!(refused(&sk));
+        let mut sk = good.clone();
+        let first = sk.offsets[0].outputs[0].clone();
+        sk.offsets[0].outputs.push(first);
+        assert!(refused(&sk));
+        // Points an offset must not move: the origin as a corner arc's centre, a point of a
+        // source curve as a spline's node, and one node in two of its splines.
+        let outputs: Vec<usize> = good.offsets[0].outputs.iter().map(|id| good.curve_index(id).unwrap()).collect();
+        let arc = *outputs.iter().find(|c| matches!(good.curves[**c].kind, CurveKind::Arc { .. })).unwrap();
+        let splines: Vec<usize> = outputs.iter().copied().filter(|c| matches!(good.curves[*c].kind, CurveKind::Spline { .. })).collect();
+        let mut sk = good.clone();
+        if let CurveKind::Arc { c, .. } = &mut sk.curves[arc].kind {
+            *c = 0;
+        }
+        assert!(refused(&sk));
+        let taken = good.curves[good.curve_index(&source).unwrap()].kind.point_ids()[0];
+        let mut sk = good.clone();
+        if let CurveKind::Spline { pts, .. } = &mut sk.curves[splines[0]].kind {
+            pts[1] = taken;
+        }
+        assert!(refused(&sk));
+        let mut sk = good.clone();
+        let shared = good.curves[splines[0]].kind.point_ids()[1];
+        if let CurveKind::Spline { pts, .. } = &mut sk.curves[splines[1]].kind {
+            pts[1] = shared;
+        }
+        assert!(refused(&sk));
+        // Another kind of offset that follows a trimmed one, and a trimmed one that follows
+        // itself through a second record.
+        let mut sk = good.clone();
+        sk.offsets.push(crate::OffsetChain {
+            sources: vec![(good.offsets[0].outputs[0].clone(), true)],
+            outputs: vec![source.clone()],
+            distance: 1.0,
+            closed: false,
+            topology: None,
+            trimmed: false,
+        });
+        assert!(refused(&sk));
+        let mut sk = good.clone();
+        let mut second = good.offsets[0].clone();
+        second.sources = vec![(good.offsets[0].outputs[0].clone(), true)];
+        second.outputs = vec![good.offsets[0].sources[0].0.clone()];
+        sk.offsets.insert(0, second);
+        assert!(refused(&sk));
+        // One output fewer than the outline has curves: the outline no longer matches.
+        let mut sk = good.clone();
+        sk.offsets[0].outputs.pop();
+        assert!(sk.refresh_offsets().is_err());
+        // An output whose points were rewired elsewhere.
+        let mut sk = good.clone();
+        let output = sk.curve_index(&good.offsets[0].outputs[0]).unwrap();
+        sk.curves[output].kind.map_points(&|_| 0);
+        assert!(sk.refresh_offsets().is_err());
     }
 
     #[test]
